@@ -1,0 +1,12 @@
+[package]
+name = "fio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+io-uring.workspace = true
+libc.workspace = true
+slab.workspace = true
+
+[dev-dependencies]
+static_assertions.workspace = true

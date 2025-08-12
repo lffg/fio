@@ -1,0 +1,13 @@
+[workspace]
+members = ["fio"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0-alpha.1"
+edition = "2021"
+
+[workspace.dependencies]
+io-uring = "0.7.9"
+libc = "0.2"
+slab = "0.4.11"
+static_assertions = "1.1.0"
