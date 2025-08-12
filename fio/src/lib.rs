@@ -1,5 +1,11 @@
 use std::{
-    any::Any, cell::RefCell, future::Future, io, ops::DerefMut, path::Path, pin::pin, task::Poll,
+    any::Any,
+    cell::RefCell,
+    future::Future,
+    ops::DerefMut,
+    path::Path,
+    pin::{pin, Pin},
+    task::{Context, Poll},
 };
 
 use io_uring::{
@@ -9,13 +15,19 @@ use io_uring::{
 };
 use slab::Slab;
 
+use crate::{fs::Fd, util::ErrorWithData};
+
+pub mod fs;
+pub mod io;
+pub mod time;
+
 mod util;
 
 const TICKS_MS: u32 = 10;
 const DEFAULT_ENTRIES: u32 = 512;
 const WAIT_WANTED: usize = 16;
 
-type BufResult<T, Buf = Vec<u8>> = (Buf, io::Result<T>);
+type BufResult<T, Buf = Vec<u8>> = (Buf, std::io::Result<T>);
 
 enum Lifecycle {
     Pending,
@@ -23,9 +35,6 @@ enum Lifecycle {
     Ignored(Box<dyn Any>),
     Completed(i32),
 }
-
-#[derive(Copy, Clone)]
-pub struct Fd(i32);
 
 struct IoInner {
     uring: IoUring,
@@ -39,210 +48,106 @@ pub struct Io(&'static RefCell<IoInner>);
 static_assertions::assert_not_impl_all!(Io: Send, Send);
 
 impl Io {
-    fn get_mut(self) -> impl DerefMut<Target = IoInner> {
-        self.0.borrow_mut()
-    }
-
     /// Opens the file.
-    pub async fn open(self, path: impl AsRef<Path>) -> io::Result<Fd> {
-        op::Op::new(self, op::OpenAt::at_cwd(path.as_ref()))?.await
+    pub async fn open(self, path: impl AsRef<Path>) -> std::io::Result<Fd> {
+        self.op(crate::fs::OpenAt::at_cwd(path.as_ref()))?.await
     }
 
     /// Similar to read(2): attempts to read up to `buf.len()` bytes from the
     /// file descriptor into the buffer. Returns the amount of bytes read.
     pub async fn read(self, buf: Vec<u8>, fd: Fd) -> BufResult<usize> {
-        match op::Op::new(self, op::Read { fd, buf }) {
+        match self.op(crate::io::Read { fd, buf }) {
             Ok(op) => op.await,
             Err(error) => error.unpack(|d| d.buf),
         }
     }
 
-    pub async fn sleep(self, millis: u64) -> io::Result<()> {
-        op::Op::new(self, op::Sleep::from_millis(millis))?.await
+    /// Sleeps for the specified amount of milliseconds.
+    pub async fn sleep(self, millis: u64) -> std::io::Result<()> {
+        self.op(crate::time::Sleep::from_millis(millis))?.await
     }
 }
 
-struct ErrorWithData<D>(io::Error, D);
+/// Private utilities.
+impl Io {
+    fn get_mut(self) -> impl DerefMut<Target = IoInner> {
+        self.0.borrow_mut()
+    }
 
-impl<D> ErrorWithData<D> {
-    #[inline]
-    pub fn unpack<T, Ok>(self, f: impl FnOnce(D) -> T) -> (T, io::Result<Ok>) {
-        (f(self.1), Err(self.0))
+    fn op<D: UringOp>(self, data: D) -> Result<Op<D>, ErrorWithData<D>> {
+        Op::new(self, data)
     }
 }
 
-impl<D> From<ErrorWithData<D>> for io::Error {
-    fn from(value: ErrorWithData<D>) -> Self {
-        value.0
+pub struct Op<D> {
+    io: Io,
+    data: Option<D>,
+    lifecycle_index: u64,
+}
+
+impl<D: UringOp> Op<D> {
+    pub fn new(io: Io, mut data: D) -> Result<Self, ErrorWithData<D>> {
+        let mut inner = io.get_mut();
+
+        let is_full = inner.uring.submission().is_full();
+        if is_full {
+            if let Err(error) = inner.uring.submit() {
+                return Err(ErrorWithData(error, data));
+            }
+        }
+
+        let lifecycle_index = inner.slab.insert(Lifecycle::Pending) as u64;
+        let entry = data.as_entry().user_data(lifecycle_index);
+
+        let push_result = unsafe { inner.uring.submission().push(&entry) };
+        // This should not fail: we submitted above if queue was full.
+        assert!(push_result.is_ok());
+
+        Ok(Op {
+            io,
+            data: Some(data),
+            lifecycle_index,
+        })
     }
 }
 
-mod op {
-    use std::{
-        ffi::CString,
-        future::Future,
-        io,
-        path::Path,
-        pin::Pin,
-        task::{Context, Poll},
-    };
+impl<D: UringOp + Unpin> Future for Op<D> {
+    type Output = D::Output;
 
-    use io_uring::{
-        opcode, squeue,
-        types::{self, Timespec},
-    };
-
-    use crate::{
-        util::{into_c_string, map_buf_result, map_result},
-        BufResult, ErrorWithData, Io, Lifecycle,
-    };
-
-    pub struct Op<D> {
-        io: Io,
-        data: Option<D>,
-        lifecycle_index: u64,
-    }
-
-    impl<D: UringOp> Op<D> {
-        pub fn new(io: Io, mut data: D) -> Result<Self, ErrorWithData<D>> {
-            let mut inner = io.get_mut();
-
-            let is_full = inner.uring.submission().is_full();
-            if is_full {
-                if let Err(error) = inner.uring.submit() {
-                    return Err(ErrorWithData(error, data));
-                }
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut *self.io.get_mut();
+        match inner.slab.get(self.lifecycle_index as usize) {
+            Some(Lifecycle::Completed(result)) => {
+                let result = *result;
+                inner.slab.remove(self.lifecycle_index as usize);
+                let data = {
+                    // SAFETY: We're not moving `self` in this block.
+                    // Also, `D` (the type of data) must be unpin.
+                    let this = unsafe { self.get_unchecked_mut() };
+                    this.data
+                        .take()
+                        .expect("data must exist for completed lifecycle")
+                };
+                Poll::Ready(D::into_result(data, result))
             }
-
-            let lifecycle_index = inner.slab.insert(Lifecycle::Pending) as u64;
-            let entry = data.as_entry().user_data(lifecycle_index);
-
-            let push_result = unsafe { inner.uring.submission().push(&entry) };
-            // This should not fail: we submitted above if queue was full.
-            assert!(push_result.is_ok());
-
-            Ok(Op {
-                io,
-                data: Some(data),
-                lifecycle_index,
-            })
+            Some(Lifecycle::Ignored(_)) => todo!(), // ???
+            Some(Lifecycle::Pending) => Poll::Pending,
+            None => unreachable!("lifecycle must exist"),
         }
     }
+}
 
-    impl<D: UringOp + Unpin> Future for Op<D> {
-        type Output = D::Output;
+/// # Safety
+///
+/// - Implementors must ensure correct op-to-entry and entry-to-op
+///   conversions.
+/// - Even though `as_entry` receives a `&mut self`, implementors MUST NOT
+///   move the value pointed by `&mut self`.
+pub unsafe trait UringOp: Unpin {
+    type Output;
 
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let inner = &mut *self.io.get_mut();
-            match inner.slab.get(self.lifecycle_index as usize) {
-                Some(Lifecycle::Completed(result)) => {
-                    let result = *result;
-                    inner.slab.remove(self.lifecycle_index as usize);
-                    let data = {
-                        // SAFETY: We're not moving `self` in this block.
-                        // Also, `D` (the type of data) must be unpin.
-                        let this = unsafe { self.get_unchecked_mut() };
-                        this.data
-                            .take()
-                            .expect("data must exist for completed lifecycle")
-                    };
-                    Poll::Ready(D::into_result(data, result))
-                }
-                Some(Lifecycle::Ignored(_)) => todo!(), // ???
-                Some(Lifecycle::Pending) => Poll::Pending,
-                None => unreachable!("lifecycle must exist"),
-            }
-        }
-    }
-
-    /// # Safety
-    ///
-    /// - Implementors must ensure correct op-to-entry and entry-to-op
-    ///   conversions.
-    /// - Even though `as_entry` receives a `&mut self`, implementors MUST NOT
-    ///   move the value pointed by `&mut self`.
-    pub unsafe trait UringOp: Unpin {
-        type Output;
-
-        fn as_entry(&mut self) -> squeue::Entry;
-        fn into_result(self, result: i32) -> Self::Output;
-    }
-
-    pub struct OpenAt {
-        path: CString,
-    }
-
-    impl OpenAt {
-        pub fn at_cwd(path: &Path) -> Self {
-            OpenAt {
-                path: into_c_string(path.as_os_str()),
-            }
-        }
-    }
-
-    unsafe impl UringOp for OpenAt {
-        type Output = io::Result<crate::Fd>;
-
-        fn as_entry(&mut self) -> squeue::Entry {
-            opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), self.path.as_ptr()).build()
-        }
-
-        fn into_result(self, result: i32) -> Self::Output {
-            map_result(result, crate::Fd)
-        }
-    }
-
-    pub struct Read {
-        pub buf: Vec<u8>,
-        pub fd: crate::Fd,
-    }
-
-    unsafe impl UringOp for Read {
-        type Output = BufResult<usize>;
-
-        fn as_entry(&mut self) -> squeue::Entry {
-            opcode::Read::new(
-                types::Fd(self.fd.0),
-                self.buf.as_mut_ptr(),
-                u32::try_from(self.buf.len()).unwrap(),
-            )
-            .build()
-        }
-
-        fn into_result(self, result: i32) -> Self::Output {
-            // TODO: Handle results greater than 2^31 - 1
-            map_buf_result(result, self.buf, |n| n as usize)
-        }
-    }
-
-    pub struct Sleep {
-        ts: Box<Timespec>,
-    }
-
-    impl Sleep {
-        pub fn from_millis(millis: u64) -> Self {
-            let sec = millis / 1000;
-            let nsec = (millis % 1000) * 1000 * 1000;
-            let ts = Timespec::new().sec(sec).nsec(nsec as u32);
-            Sleep { ts: Box::new(ts) }
-        }
-    }
-
-    unsafe impl UringOp for Sleep {
-        type Output = io::Result<()>;
-
-        fn as_entry(&mut self) -> squeue::Entry {
-            opcode::Timeout::new(&*self.ts as *const _).count(0).build()
-        }
-
-        fn into_result(self, result: i32) -> Self::Output {
-            if result == -libc::ETIME {
-                Ok(())
-            } else {
-                Err(io::Error::from_raw_os_error(-result))
-            }
-        }
-    }
+    fn as_entry(&mut self) -> squeue::Entry;
+    fn into_result(self, result: i32) -> Self::Output;
 }
 
 pub fn block_on<F, T>(f: F) -> T

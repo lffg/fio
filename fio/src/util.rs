@@ -36,3 +36,18 @@ pub fn map_buf_result<T, B>(res: i32, buf: B, ok: impl FnOnce(i32) -> T) -> BufR
         (buf, Ok(ok(res)))
     }
 }
+
+pub struct ErrorWithData<D>(pub io::Error, pub D);
+
+impl<D> ErrorWithData<D> {
+    #[inline]
+    pub fn unpack<T, Ok>(self, f: impl FnOnce(D) -> T) -> (T, io::Result<Ok>) {
+        (f(self.1), Err(self.0))
+    }
+}
+
+impl<D> From<ErrorWithData<D>> for io::Error {
+    fn from(value: ErrorWithData<D>) -> Self {
+        value.0
+    }
+}
