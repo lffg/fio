@@ -44,8 +44,8 @@ impl Io {
         op::Op::new(self, op::OpenAt::at_cwd(path.as_ref()))?.await
     }
 
-    /// Similar to read(2): attempts to read up to `buf.capacity()` bytes from
-    /// the file descriptor into the buffer. Returns the amount of bytes read.
+    /// Similar to read(2): attempts to read up to `buf.len()` bytes from the
+    /// file descriptor into the buffer. Returns the amount of bytes read.
     pub async fn read(self, buf: Vec<u8>, fd: Fd) -> BufResult<usize> {
         match op::Op::new(self, op::Read { fd, buf }) {
             Ok(op) => op.await,
