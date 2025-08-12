@@ -9,9 +9,13 @@ use io_uring::{
 };
 use slab::Slab;
 
-type BufResult<T, Buf = Vec<u8>> = (Buf, io::Result<T>);
-
 mod util;
+
+const TICKS_MS: u32 = 10;
+const DEFAULT_ENTRIES: u32 = 512;
+const WAIT_WANTED: usize = 16;
+
+type BufResult<T, Buf = Vec<u8>> = (Buf, io::Result<T>);
 
 enum Lifecycle {
     Pending,
@@ -52,6 +56,10 @@ impl Io {
             Err(error) => error.unpack(|d| d.buf),
         }
     }
+
+    pub async fn sleep(self, millis: u64) -> io::Result<()> {
+        op::Op::new(self, op::Sleep::from_millis(millis))?.await
+    }
 }
 
 struct ErrorWithData<D>(io::Error, D);
@@ -79,7 +87,10 @@ mod op {
         task::{Context, Poll},
     };
 
-    use io_uring::{opcode, squeue, types};
+    use io_uring::{
+        opcode, squeue,
+        types::{self, Timespec},
+    };
 
     use crate::{
         util::{into_c_string, map_buf_result, map_result},
@@ -118,7 +129,7 @@ mod op {
         }
     }
 
-    impl<D: UringOp> Future for Op<D> {
+    impl<D: UringOp + Unpin> Future for Op<D> {
         type Output = D::Output;
 
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -129,6 +140,7 @@ mod op {
                     inner.slab.remove(self.lifecycle_index as usize);
                     let data = {
                         // SAFETY: We're not moving `self` in this block.
+                        // Also, `D` (the type of data) must be unpin.
                         let this = unsafe { self.get_unchecked_mut() };
                         this.data
                             .take()
@@ -149,7 +161,7 @@ mod op {
     ///   conversions.
     /// - Even though `as_entry` receives a `&mut self`, implementors MUST NOT
     ///   move the value pointed by `&mut self`.
-    pub unsafe trait UringOp {
+    pub unsafe trait UringOp: Unpin {
         type Output;
 
         fn as_entry(&mut self) -> squeue::Entry;
@@ -176,7 +188,7 @@ mod op {
         }
 
         fn into_result(self, result: i32) -> Self::Output {
-            map_result(result, |fd| crate::Fd(fd))
+            map_result(result, crate::Fd)
         }
     }
 
@@ -202,15 +214,41 @@ mod op {
             map_buf_result(result, self.buf, |n| n as usize)
         }
     }
+
+    pub struct Sleep {
+        ts: Box<Timespec>,
+    }
+
+    impl Sleep {
+        pub fn from_millis(millis: u64) -> Self {
+            let sec = millis / 1000;
+            let nsec = (millis % 1000) * 1000 * 1000;
+            let ts = Timespec::new().sec(sec).nsec(nsec as u32);
+            Sleep { ts: Box::new(ts) }
+        }
+    }
+
+    unsafe impl UringOp for Sleep {
+        type Output = io::Result<()>;
+
+        fn as_entry(&mut self) -> squeue::Entry {
+            opcode::Timeout::new(&*self.ts as *const _).count(0).build()
+        }
+
+        fn into_result(self, result: i32) -> Self::Output {
+            if result == -libc::ETIME {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(-result))
+            }
+        }
+    }
 }
 
 pub fn block_on<F, T>(f: F) -> T
 where
     F: AsyncFnOnce(Io) -> T,
 {
-    const DEFAULT_ENTRIES: u32 = 512;
-    const WAIT_WANTED: usize = 16;
-
     let uring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
         .build(DEFAULT_ENTRIES)
         .expect("must build io_uring");
@@ -220,6 +258,10 @@ where
             uring,
             slab: Slab::with_capacity(DEFAULT_ENTRIES as usize),
         };
+        // NOTE: This leak is intentional to make the `Io` type copyable. This
+        // is a tradeoff we pay for a more ergonomic API. It is worth it since
+        // not only runtime creation is infrequent, but they also tend to have
+        // a lifetime almost as long as the program's lifetime.
         Io(Box::leak::<'static>(Box::new(RefCell::new(inner))))
     };
 
@@ -232,8 +274,7 @@ where
     // proper waker.
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 
-    // 5 ms = 5^3 us = 5^6 ns
-    let wait_ts = Timespec::new().nsec(5 * 1000 * 1000);
+    let wait_ts = Timespec::new().nsec(TICKS_MS * 1000 * 1000);
     let submit_args = SubmitArgs::new().timespec(&wait_ts);
 
     loop {
@@ -243,26 +284,32 @@ where
                 println!("resolved!");
                 return resolved;
             }
-            Poll::Pending => println!("not ready"),
+            Poll::Pending => println!("not ready, will wait"),
         }
 
         loop {
-            println!("waiting...");
             let inner = &mut *io.get_mut();
 
-            let n = inner
+            let submit_result = inner
                 .uring
                 .submitter()
-                .submit_with_args(WAIT_WANTED, &submit_args)
-                .expect("must be able to submit");
-            if n == 0 {
-                continue;
+                .submit_with_args(WAIT_WANTED, &submit_args);
+
+            match submit_result {
+                Ok(_) => (),
+                Err(error) if error.raw_os_error() == Some(libc::ETIME) => {
+                    continue;
+                }
+                Err(error) => panic!("failed to submit: {error}"),
             }
-            println!("got {n} CQEs");
+
             let mut cq = inner.uring.completion();
-            for _ in 0..n {
+            println!("got {} CQEs", cq.len());
+            for _ in 0..cq.len() {
                 let entry = cq.next().expect("should have completion entry");
-                match inner.slab.get_mut(entry.user_data() as usize) {
+                let lifecycle_index = entry.user_data();
+                println!("completed index: {lifecycle_index}");
+                match inner.slab.get_mut(lifecycle_index as usize) {
                     Some(Lifecycle::Completed(_)) => unreachable!(),
                     Some(Lifecycle::Ignored(_)) => todo!(), // ???
                     Some(it @ Lifecycle::Pending) => {

@@ -1,7 +1,5 @@
-use fio::block_on;
-
 fn main() {
-    block_on(async |io| {
+    fio::block_on(async |io| {
         let buf = vec![0; 256];
 
         let f = io.open("Cargo.toml").await.expect("should open file");
