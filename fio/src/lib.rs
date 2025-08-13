@@ -108,8 +108,12 @@ impl Io {
     }
 
     /// Sleeps for the specified amount of milliseconds.
-    pub async fn sleep(self, millis: u64) -> std::io::Result<()> {
-        self.op(crate::time::Sleep::from_millis(millis))?.await
+    pub async fn sleep(self, millis: u64) {
+        self.op(crate::time::Sleep::from_millis(millis))
+            .map_err(|ErrorWithData(error, _)| error)
+            .expect("sad reality")
+            .await
+            .expect("sad reality");
     }
 }
 
