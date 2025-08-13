@@ -2,6 +2,8 @@
 name = "fio"
 version.workspace = true
 edition.workspace = true
+description.workspace = true
+license.workspace = true
 
 [dependencies]
 io-uring.workspace = true
