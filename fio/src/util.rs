@@ -51,3 +51,15 @@ impl<D> From<ErrorWithData<D>> for io::Error {
         value.0
     }
 }
+
+#[inline]
+#[cold]
+fn cold() {}
+
+#[inline]
+pub fn unlikely(b: bool) -> bool {
+    if b {
+        cold()
+    }
+    b
+}

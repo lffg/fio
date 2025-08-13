@@ -1,10 +1,11 @@
 use std::{
     any::Any,
     cell::RefCell,
+    collections::VecDeque,
     future::Future,
     ops::DerefMut,
     path::Path,
-    pin::{pin, Pin},
+    pin::Pin,
     task::{Context, Poll},
 };
 
@@ -15,22 +16,30 @@ use io_uring::{
 };
 use slab::Slab;
 
-use crate::{fs::Fd, util::ErrorWithData};
+use crate::{
+    fs::Fd,
+    task::Task,
+    util::{unlikely, ErrorWithData},
+};
 
 pub mod fs;
 pub mod io;
+pub mod task;
 pub mod time;
 
 mod util;
 
-const TICKS_MS: u32 = 10;
+const TICKS_MS: u32 = 2500;
 const DEFAULT_ENTRIES: u32 = 512;
 const WAIT_WANTED: usize = 16;
 
 type BufResult<T, Buf = Vec<u8>> = (Buf, std::io::Result<T>);
 
 enum Lifecycle {
-    Pending,
+    Pending {
+        /// Index of the task which requested this IO operation.
+        index: task::Index,
+    },
     #[expect(dead_code)]
     Ignored(Box<dyn Any>),
     Completed(i32),
@@ -38,7 +47,21 @@ enum Lifecycle {
 
 struct IoInner {
     uring: IoUring,
-    slab: Slab<Lifecycle>,
+    io_lifecycle_slab: Slab<Lifecycle>,
+    task_slab: Slab<Task>,
+    task_queue: VecDeque<task::Index>,
+    /// Index of the current task.
+    task_current: task::Index,
+    /// ID of the *next* task.
+    task_id_next: usize,
+}
+
+impl IoInner {
+    fn next_task_id(&mut self) -> usize {
+        let next = self.task_id_next;
+        self.task_id_next += 1;
+        next
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -48,6 +71,28 @@ pub struct Io(&'static RefCell<IoInner>);
 static_assertions::assert_not_impl_all!(Io: Send, Send);
 
 impl Io {
+    /// Spawns a new task.
+    pub fn spawn<Fut, T>(self, fut: Fut) -> task::Handle<T>
+    where
+        Fut: Future<Output = T> + 'static,
+        T: Any,
+    {
+        let inner = &mut *self.get_mut();
+
+        let id = inner.next_task_id();
+        let index = inner.task_slab.vacant_key();
+        let (task, handle) = task::Task::new(self, id, index, fut);
+
+        let actual_index = inner.task_slab.insert(task);
+        assert_eq!(index, actual_index);
+
+        // Schedule the task to be executed (without waiting for the handle to
+        // be awaited).
+        inner.task_queue.push_back(task::Index(actual_index));
+
+        handle
+    }
+
     /// Opens the file.
     pub async fn open(self, path: impl AsRef<Path>) -> std::io::Result<Fd> {
         self.op(crate::fs::OpenAt::at_cwd(path.as_ref()))?.await
@@ -96,7 +141,8 @@ impl<D: UringOp> Op<D> {
             }
         }
 
-        let lifecycle_index = inner.slab.insert(Lifecycle::Pending) as u64;
+        let index = inner.task_current;
+        let lifecycle_index = inner.io_lifecycle_slab.insert(Lifecycle::Pending { index }) as u64;
         let entry = data.as_entry().user_data(lifecycle_index);
 
         let push_result = unsafe { inner.uring.submission().push(&entry) };
@@ -116,10 +162,12 @@ impl<D: UringOp + Unpin> Future for Op<D> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner = &mut *self.io.get_mut();
-        match inner.slab.get(self.lifecycle_index as usize) {
+        match inner.io_lifecycle_slab.get(self.lifecycle_index as usize) {
             Some(Lifecycle::Completed(result)) => {
                 let result = *result;
-                inner.slab.remove(self.lifecycle_index as usize);
+                inner
+                    .io_lifecycle_slab
+                    .remove(self.lifecycle_index as usize);
                 let data = {
                     // SAFETY: We're not moving `self` in this block.
                     // Also, `D` (the type of data) must be unpin.
@@ -131,7 +179,7 @@ impl<D: UringOp + Unpin> Future for Op<D> {
                 Poll::Ready(D::into_result(data, result))
             }
             Some(Lifecycle::Ignored(_)) => todo!(), // ???
-            Some(Lifecycle::Pending) => Poll::Pending,
+            Some(Lifecycle::Pending { .. }) => Poll::Pending,
             None => unreachable!("lifecycle must exist"),
         }
     }
@@ -152,7 +200,8 @@ pub unsafe trait UringOp: Unpin {
 
 pub fn block_on<F, T>(f: F) -> T
 where
-    F: AsyncFnOnce(Io) -> T,
+    F: AsyncFnOnce(Io) -> T + 'static,
+    T: Any,
 {
     let uring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
         .build(DEFAULT_ENTRIES)
@@ -161,7 +210,11 @@ where
     let io = {
         let inner = IoInner {
             uring,
-            slab: Slab::with_capacity(DEFAULT_ENTRIES as usize),
+            io_lifecycle_slab: Slab::with_capacity(DEFAULT_ENTRIES as usize),
+            task_slab: Slab::with_capacity(DEFAULT_ENTRIES as usize),
+            task_queue: VecDeque::with_capacity(DEFAULT_ENTRIES as usize),
+            task_current: task::Index(0),
+            task_id_next: 0,
         };
         // NOTE: This leak is intentional to make the `Io` type copyable. This
         // is a tradeoff we pay for a more ergonomic API. It is worth it since
@@ -171,7 +224,8 @@ where
     };
 
     let fut = f(io);
-    let mut fut = pin!(fut);
+    let main_task_handle = io.spawn(fut);
+    assert_eq!(main_task_handle.index.0, 0);
 
     // Build the context, which includes the waker.
     // For now, since this runtime doesn't need to handle scheduling (there is
@@ -183,44 +237,85 @@ where
     let submit_args = SubmitArgs::new().timespec(&wait_ts);
 
     loop {
-        println!("will poll");
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(resolved) => {
-                println!("resolved!");
-                return resolved;
+        // Run all tasks on the queue.
+        'queue: loop {
+            let (index, id, mut fut) = {
+                let inner = &mut *io.get_mut();
+
+                let Some(index) = inner.task_queue.pop_front() else {
+                    println!("  (no more queued tasks)");
+                    // There are no more tasks.
+                    break 'queue;
+                };
+                let task = &mut inner.task_slab[index.0];
+                let fut = task.fut.take().unwrap();
+
+                inner.task_current = index;
+                (index, task.id, fut)
+            };
+
+            println!("  (will poll from #{id:?})");
+            let poll_result = fut.as_mut().poll(&mut cx);
+
+            let inner = &mut *io.get_mut();
+            let task = &mut inner.task_slab[index.0];
+            task.fut = Some(fut);
+
+            match poll_result {
+                Poll::Ready(resolved) => {
+                    if unlikely(id.is_main()) {
+                        println!("    -> ready! [MAIN!!] bye!");
+                        let resolved: Box<T> = resolved.downcast().unwrap();
+                        return *resolved;
+                    }
+
+                    println!("    -> ready!");
+                    task.value = Some(resolved);
+                    if let task::Waiter::Waiting(index) = task.waiter {
+                        inner.task_queue.push_back(index);
+                    }
+                }
+                Poll::Pending => println!("    -> pending"),
             }
-            Poll::Pending => println!("not ready, will wait"),
         }
 
+        // Loop until there are new events.
         loop {
             let inner = &mut *io.get_mut();
 
+            println!("  (submitting)");
             let submit_result = inner
                 .uring
                 .submitter()
                 .submit_with_args(WAIT_WANTED, &submit_args);
+            println!("    -> done");
 
             match submit_result {
                 Ok(_) => (),
+                // Timeout without new events.
                 Err(error) if error.raw_os_error() == Some(libc::ETIME) => {
-                    continue;
+                    println!("  (timeout without ANY events)");
                 }
                 Err(error) => panic!("failed to submit: {error}"),
             }
 
             let mut cq = inner.uring.completion();
-            println!("got {} CQEs", cq.len());
+            println!("  (got {} CQEs)", cq.len());
             for _ in 0..cq.len() {
                 let entry = cq.next().expect("should have completion entry");
                 let lifecycle_index = entry.user_data();
-                println!("completed index: {lifecycle_index}");
-                match inner.slab.get_mut(lifecycle_index as usize) {
-                    Some(Lifecycle::Completed(_)) => unreachable!(),
-                    Some(Lifecycle::Ignored(_)) => todo!(), // ???
-                    Some(it @ Lifecycle::Pending) => {
-                        *it = Lifecycle::Completed(entry.result());
+                println!("  [completed IO-op lifecylce index: {lifecycle_index}]");
+                let Some(lifecycle) = inner.io_lifecycle_slab.get_mut(lifecycle_index as usize)
+                else {
+                    panic!("lifecycle must exist");
+                };
+                match lifecycle {
+                    Lifecycle::Completed(_) => unreachable!(),
+                    Lifecycle::Ignored(_) => todo!(), // ???
+                    Lifecycle::Pending { index } => {
+                        inner.task_queue.push_back(*index);
+                        *lifecycle = Lifecycle::Completed(entry.result());
                     }
-                    None => unreachable!("lifecycle must exist"),
                 }
             }
 
